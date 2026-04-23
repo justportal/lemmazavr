@@ -11,7 +11,6 @@ import org.deeplearning4j.optimize.listeners.ScoreIterationListener;
 import org.deeplearning4j.util.ModelSerializer;
 import org.nd4j.linalg.activations.Activation;
 import org.nd4j.linalg.api.ndarray.INDArray;
-import org.nd4j.linalg.dataset.DataSet;
 import org.nd4j.linalg.factory.Nd4j;
 import org.nd4j.linalg.learning.config.Adam;
 import org.nd4j.linalg.lossfunctions.LossFunctions;
@@ -21,10 +20,10 @@ import org.slf4j.LoggerFactory;
 import java.io.File;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
 import java.nio.file.Files;
 import java.nio.file.Paths;
 import java.util.*;
-import java.util.stream.Collectors;
 
 /**
  * Лемматизатор на основе нейронной сети (LSTM).
@@ -79,20 +78,17 @@ public class Lemmatizer {
         trainConfig.validate();
 
         try {
-            log.info("Чтение датасета: {}", datasetPath);
-            List<WordPair> rawData = readTSV(datasetPath);
+            Path dataset = Paths.get(datasetPath);
+            log.info("Подготовка датасета: {}", datasetPath);
+            long sampleCount = buildVocabulary(dataset);
 
-            if (rawData.isEmpty()) {
+            if (sampleCount == 0) {
                 throw new IllegalStateException("Датасет пуст или не содержит валидных строк.");
             }
 
-            Collections.shuffle(rawData);
-            buildVocabulary(rawData);
-
-            log.info("Словарь построен. Размер: {}, MAX_LEN: {}", vocabSize, trainConfig.getMaxLen());
-
-            List<DataSet> dataSets = createDataSets(rawData, trainConfig);
-            log.info("Данные подготовлены. Батчей: {}", dataSets.size());
+            int batchCount = (int) Math.ceil((double) sampleCount / trainConfig.getBatchSize());
+            log.info("Словарь построен. Размер: {}, MAX_LEN: {}, примеров: {}, батчей на эпоху: {}",
+                    vocabSize, trainConfig.getMaxLen(), sampleCount, batchCount);
 
             MultiLayerNetwork model = buildModel(trainConfig);
             model.init();
@@ -101,9 +97,14 @@ public class Lemmatizer {
             log.info("Начало обучения...");
             for (int epoch = 0; epoch < trainConfig.getEpochs(); epoch++) {
                 long start = System.currentTimeMillis();
-                for (DataSet ds : dataSets) {
-                    model.fit(ds);
-                }
+                LemmatizerDataSetIterator iterator = new LemmatizerDataSetIterator(
+                        dataset,
+                        trainConfig.getBatchSize(),
+                        trainConfig.getMaxLen(),
+                        charToIndex,
+                        vocabSize
+                );
+                model.fit(iterator);
                 long duration = System.currentTimeMillis() - start;
                 log.info("Эпоха {}/{} завершена за {} мс", epoch + 1, trainConfig.getEpochs(), duration);
             }
@@ -167,28 +168,23 @@ public class Lemmatizer {
     /**
      * Читает TSV файл с парами словоформа-лемма.
      */
-    private List<WordPair> readTSV(String path) throws IOException {
-        return Files.lines(Paths.get(path), StandardCharsets.UTF_8)
-                .map(String::trim)
-                .filter(line -> !line.isEmpty() && !line.startsWith("#"))
-                .map(line -> line.split("\t"))
-                .filter(parts -> parts.length >= 2)
-                .map(parts -> new WordPair(parts[0].trim(), parts[1].trim()))
-                .filter(pair -> !pair.getWordForm().isEmpty() && !pair.getLemma().isEmpty())
-                .collect(Collectors.toList());
-    }
-
-    /**
-     * Строит словарь символов из данных.
-     */
-    private void buildVocabulary(List<WordPair> data) {
+    private long buildVocabulary(Path datasetPath) throws IOException {
         Set<Character> chars = new TreeSet<>();
         chars.add(PADDING_CHAR);
         chars.add(END_CHAR);
 
-        for (WordPair pair : data) {
-            pair.getWordForm().chars().mapToObj(c -> (char) c).forEach(chars::add);
-            pair.getLemma().chars().mapToObj(c -> (char) c).forEach(chars::add);
+        long validRows = 0;
+        try (var lines = Files.lines(datasetPath, StandardCharsets.UTF_8)) {
+            Iterator<String> iterator = lines.iterator();
+            while (iterator.hasNext()) {
+                WordPair pair = parseWordPair(iterator.next());
+                if (pair == null) {
+                    continue;
+                }
+                validRows++;
+                pair.getWordForm().chars().mapToObj(c -> (char) c).forEach(chars::add);
+                pair.getLemma().chars().mapToObj(c -> (char) c).forEach(chars::add);
+            }
         }
 
         charToIndex = new HashMap<>();
@@ -202,6 +198,34 @@ public class Lemmatizer {
         }
 
         vocabSize = chars.size();
+        return validRows;
+    }
+
+    /**
+     * Парсит строку TSV в пару словоформа-лемма.
+     */
+    private WordPair parseWordPair(String line) {
+        if (line == null) {
+            return null;
+        }
+
+        String trimmed = line.trim();
+        if (trimmed.isEmpty() || trimmed.startsWith("#")) {
+            return null;
+        }
+
+        String[] parts = trimmed.split("\t");
+        if (parts.length < 2) {
+            return null;
+        }
+
+        String wordForm = parts[0].trim();
+        String lemma = parts[1].trim();
+        if (wordForm.isEmpty() || lemma.isEmpty()) {
+            return null;
+        }
+
+        return new WordPair(wordForm, lemma);
     }
 
     /**
@@ -240,71 +264,6 @@ public class Lemmatizer {
         }
 
         log.info("Словарь восстановлен из модели. Размер: {}", vocabSize);
-    }
-
-    /**
-     * Создаёт батчи данных с one-hot кодированием.
-     */
-    private List<DataSet> createDataSets(List<WordPair> data, LemmatizerConfig cfg) {
-        List<DataSet> dataSetList = new ArrayList<>();
-        int numBatches = (int) Math.ceil((double) data.size() / cfg.getBatchSize());
-
-        for (int b = 0; b < numBatches; b++) {
-            int start = b * cfg.getBatchSize();
-            int end = Math.min(start + cfg.getBatchSize(), data.size());
-            int currentBatchSize = end - start;
-
-            // Формат RNN в DL4J: [minibatch, size, time]
-            INDArray features = Nd4j.zeros(currentBatchSize, vocabSize, cfg.getMaxLen());
-            INDArray labels = Nd4j.zeros(currentBatchSize, vocabSize, cfg.getMaxLen());
-            INDArray labelsMask = Nd4j.zeros(currentBatchSize, cfg.getMaxLen());
-
-            for (int i = start; i < end; i++) {
-                int batchIdx = i - start;
-                WordPair pair = data.get(i);
-
-                fillInput(features, batchIdx, pair.getWordForm(), cfg.getMaxLen());
-                fillLabel(labels, labelsMask, batchIdx, pair.getLemma(), cfg.getMaxLen());
-            }
-
-            dataSetList.add(new DataSet(features, labels, null, labelsMask));
-        }
-
-        return dataSetList;
-    }
-
-    /**
-     * Заполняет входной тензор one-hot представлением символов.
-     */
-    private void fillInput(INDArray arr, int batchIdx, String text, int maxLen) {
-        int len = Math.min(text.length(), maxLen);
-
-        for (int t = 0; t < len; t++) {
-            int charIdx = charToIndex.getOrDefault(text.charAt(t), 0);
-            arr.putScalar(new int[]{batchIdx, charIdx, t}, 1.0);
-        }
-
-        for (int t = len; t < maxLen; t++) {
-            arr.putScalar(new int[]{batchIdx, 0, t}, 1.0);
-        }
-    }
-
-    /**
-     * Заполняет целевой тензор символами леммы и явным признаком конца слова.
-     */
-    private void fillLabel(INDArray arr, INDArray mask, int batchIdx, String text, int maxLen) {
-        int len = Math.min(text.length(), Math.max(0, maxLen - 1));
-
-        for (int t = 0; t < len; t++) {
-            int charIdx = charToIndex.getOrDefault(text.charAt(t), 0);
-            arr.putScalar(new int[]{batchIdx, charIdx, t}, 1.0);
-            mask.putScalar(new int[]{batchIdx, t}, 1.0);
-        }
-
-        if (len < maxLen) {
-            arr.putScalar(new int[]{batchIdx, charToIndex.get(END_CHAR), len}, 1.0);
-            mask.putScalar(new int[]{batchIdx, len}, 1.0);
-        }
     }
 
     /**
